@@ -5,12 +5,6 @@ import plotly.express as px
 import streamlit as st
 import yfinance as yf
 
-# 🌟 為了連線 Google 雲端額外引入的工具
-from google_auth_oauthlib.flow import Flow
-from google.oauth2.credentials import Credentials
-import gspread
-from dotenv import load_dotenv
-
 # ==========================================
 # 0. 網頁基本設定 & 精緻樣式
 # ==========================================
@@ -85,135 +79,30 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("📈 股票助理")
-st.caption("個人台股投資組合與多策略風險管理中心")
+st.title("📈 股票助理 (體驗版)")
+st.caption("個人台股投資組合與多策略風險管理中心 - 免登入即時體驗")
 
 # ==========================================
-# 🌟 Google 雲端連線設定中心 (讀取環境變數)
+# 1. 初始化獨立臨時資料庫（Streamlit 內建隔離機制）
 # ==========================================
-load_dotenv()
-CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-REDIRECT_URI = "http://localhost:8501/"
-SCOPES = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
-
-
-def create_oauth_flow():
-    client_config = {
-        "web": {
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://accounts.google.com/o/oauth2/token",
-        }
-    }
-    return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
-
-
-def get_google_sheet(creds_dict):
-    creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
-    client = gspread.authorize(creds)
-    file_name = "My_Stock_Assistant_Data"
-    try:
-        sh = client.open(file_name)
-    except gspread.exceptions.SpreadsheetNotFound:
-        sh = client.create(file_name)
-        ws = sh.get_worksheet(0)
-        ws.append_row(
-            ["股票代號", "股票名稱", "交易類型", "股數", "成交單價", "交易時間", "手續費", "證交稅", "總收付金額",
-             "策略標籤", "交易心得"])
-    return sh.get_worksheet(0)
-
-
-# ==========================================
-# 🌟 核心使用者驗證防護牆 (支援免登入試用)
-# ==========================================
-# 初始化試用模式的臨時資料庫（每個人獨立）
-if "demo_mode" not in st.session_state:
-    st.session_state.demo_mode = False
+# 每一個瀏覽器分頁進來，都會擁有自己獨立的 demo_trades，彼此完全隔離
 if "demo_trades" not in st.session_state:
     st.session_state.demo_trades = pd.DataFrame(columns=[
         "股票代號", "股票名稱", "交易類型", "股數", "成交單價", "交易時間", "手續費", "證交稅", "總收付金額",
         "策略標籤", "交易心得"
     ])
 
-# 如果既沒登入，也沒開啟試用模式，就顯示大門口
-if "google_creds" not in st.session_state and not st.session_state.demo_mode:
-    st.info("👋 歡迎使用！為了保障您的資料隱私，請選擇登入方式或直接開啟試用。")
+# 貼心提示使用者本網頁的運作規則
+st.sidebar.info("⚡ 本站為【免登入即時體驗版】，每位使用者的資料皆完全獨立隔離（A 的變動絕不會影響 B）。")
+st.sidebar.warning("⚠️ 請注意：本站不具備記憶功能，只要「重新整理網頁」或「關閉分頁」，您的暫存紀錄就會自動消失清空。")
 
-    # 建立兩欄：左邊雲端登入，右邊免登入試用
-    login_col1, login_col2 = st.columns(2)
-
-    with login_col1:
-        st.markdown("### ☁️ 雲端正式版 (永久保存)")
-        st.caption("股票資料將 100% 儲存在您自己的 Google Drive，任何人皆無法竊取。")
-        flow = create_oauth_flow()
-        auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
-        st.markdown(f'''
-            <a href="{auth_url}" target="_self">
-                <button style="background-color: #4285F4; color: white; border: none; padding: 12px 24px; font-size: 16px; border-radius: 8px; cursor: pointer; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1); width: 100%;">
-                    🔵 一鍵登入 Google 帳號
-                </button>
-            </a>
-        ''', unsafe_allow_html=True)
-
-    with login_col2:
-        st.markdown("### 🧪 免登入體驗版 (臨時暫存)")
-        st.caption("無需帳號密碼直接進去玩！每人資料完全獨立隔離，但只要重新整理或離開網頁，資料就會自動消失。")
-        if st.button("✨ 免登入：直接開啟試用體驗", use_container_width=True):
-            st.session_state.demo_mode = True
-            st.rerun()
-
-    # 接收 Google 回傳的密碼
-    query_params = st.query_params
-    if "code" in query_params:
-        try:
-            flow.fetch_token(code=query_params["code"])
-            st.session_state.google_creds = flow.credentials.to_json()
-            st.success("🎉 登入成功！正在為您對接專屬雲端硬碟...")
-            st.rerun()
-        except Exception as e:
-            st.error(f"登入驗證失敗，請重試。錯誤原因: {e}")
-    st.stop()
+# 讀取當前使用者的獨立記憶體資料
+df_trades = st.session_state.demo_trades.copy()
+if not df_trades.empty:
+    df_trades["交易ID"] = range(1, len(df_trades) + 1)
 
 # ==========================================
-# 1. 核心資料庫路由 (雲端 vs 臨時記憶體)
-# ==========================================
-is_demo = st.session_state.demo_mode
-
-if is_demo:
-    st.sidebar.warning("⚡ 目前處於【免登入試用模式】，重新整理網頁資料即會消失！")
-    if st.sidebar.button("🔑 返回登入 Google 正式版"):
-        st.session_state.demo_mode = False
-        st.rerun()
-
-    # 直接讀取記憶體裡的暫存
-    df_trades = st.session_state.demo_trades.copy()
-    if not df_trades.empty:
-        df_trades["交易ID"] = range(1, len(df_trades) + 1)
-else:
-    # 走原本的 Google 雲端試算表路線
-    try:
-        google_sheet = get_google_sheet(eval(st.session_state.google_creds))
-        rows = google_sheet.get_all_records()
-        if rows:
-            df_trades = pd.DataFrame(rows)
-            df_trades["交易ID"] = range(1, len(df_trades) + 1)
-        else:
-            df_trades = pd.DataFrame()
-    except Exception as e:
-        st.error(f"雲端連線異常: {e}")
-        if st.sidebar.button("🔄 重置連線狀態"):
-            if "google_creds" in st.session_state: del st.session_state.google_creds
-            st.rerun()
-        st.stop()
-
-    if st.sidebar.button("🔒 安全登出 Google"):
-        del st.session_state.google_creds
-        st.rerun()
-
-# ==========================================
-# 2. 全域策略切換 (網頁最頂端) - 保留原本功能
+# 2. 全域策略切換 (網頁最頂端)
 # ==========================================
 if not df_trades.empty:
     all_tags = ["✨ 顯示所有策略帳戶"] + sorted(df_trades["策略標籤"].dropna().unique().tolist())
@@ -230,7 +119,7 @@ else:
 st.write("---")
 
 # ==========================================
-# 3. 建立網頁分頁 - 保留原本功能
+# 3. 建立網頁分頁
 # ==========================================
 tab1, tab2, tab3 = st.tabs([
     "📊 持股比例圓餅圖",
@@ -239,7 +128,7 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # ------------------------------------------
-# 【分頁 1：持股比例圓餅圖】 - 保留原本功能
+# 【分頁 1：持股比例圓餅圖】
 # ------------------------------------------
 with tab1:
     st.subheader(f"📊 策略檢視：{global_selected_tag}")
@@ -302,16 +191,17 @@ with tab1:
                     column_config={"新聞連結": st.column_config.LinkColumn("📰 財經快訊", display_text="點我查看新聞")}
                 )
             with col2:
-                fig = px.pie(portfolio_df, values="目前市值", names="股票名稱", hole=0.4,
+                fig = px.pie(portfolio_df, values="currently_market_value" if False else "目前市值", names="股票名稱",
+                             hole=0.4,
                              color_discrete_sequence=px.colors.sequential.Teal_r)
                 st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("⚠️ 該策略帳戶目前無 any 庫存持股。")
+            st.warning("⚠️ 該策略帳戶目前無任何庫存持股。")
     else:
         st.info("💡 請先到交易記帳分頁紀錄您的第一筆交易並建立策略標籤。")
 
 # ------------------------------------------
-# 【分頁 2：交易記帳、流水帳與日記】 - 完美兼容分流
+# 【分頁 2：交易記帳、流水帳與日記】
 # ------------------------------------------
 with tab2:
     st.subheader("📥 新增交易紀錄")
@@ -391,20 +281,11 @@ with tab2:
                 "策略標籤": t_tag_input, "交易心得": t_notes
             }
 
-            if is_demo:
-                # 試用模式：直接追加到暫存的 dataframe 裡
-                st.session_state.demo_trades = pd.concat([st.session_state.demo_trades, pd.DataFrame([new_row])],
-                                                         ignore_index=True)
-                st.success(f"🎉 (試用暫存) 成功寫入臨時記憶體！名稱：【{t_name}】")
-                st.rerun()
-            else:
-                # 正式模式：去寫入 Google 試算表
-                try:
-                    google_sheet.append_row(list(new_row.values()))
-                    st.success(f"🎉 成功同步到您的個人雲端硬碟！名稱：【{t_name}】")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"雲端寫入失敗: {e}")
+            # 🌟 核心改裝：直接安全追加到使用者的獨立記憶體中，不碰任何外部硬碟或雲端
+            st.session_state.demo_trades = pd.concat([st.session_state.demo_trades, pd.DataFrame([new_row])],
+                                                     ignore_index=True)
+            st.success(f"🎉 成功寫入獨立暫存記憶體！名稱：【{t_name}】")
+            st.rerun()
 
     st.write("---")
 
@@ -464,21 +345,13 @@ with tab2:
                     unsafe_allow_html=True)
 
                 with col8:
+                    # 🌟 核心改裝：只從該使用者的獨立 DataFrame 裡移除紀錄
                     if st.button("🗑️", key=f"del_{row['交易ID']}"):
-                        if is_demo:
-                            # 試用模式：從 dataframe 刪除對應索引
-                            idx_to_drop = st.session_state.demo_trades.index[int(row['交易ID']) - 1]
-                            st.session_state.demo_trades = st.session_state.demo_trades.drop(idx_to_drop).reset_index(
-                                drop=True)
-                            st.success("刪除成功！")
-                            st.rerun()
-                        else:
-                            try:
-                                google_sheet.delete_rows(int(row['交易ID']) + 1)
-                                st.success("刪除成功！")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"雲端刪除失敗: {e}")
+                        idx_to_drop = st.session_state.demo_trades.index[int(row['交易ID']) - 1]
+                        st.session_state.demo_trades = st.session_state.demo_trades.drop(idx_to_drop).reset_index(
+                            drop=True)
+                        st.success("刪除成功！")
+                        st.rerun()
 
                 if pd.notna(row['交易心得']) and str(row['交易心得']).strip() != "":
                     st.markdown(
@@ -515,25 +388,14 @@ with tab2:
                              use_container_width=True)
 
         if st.button("🚨 清空所有歷史紀錄"):
-            if is_demo:
-                st.session_state.demo_trades = pd.DataFrame(columns=st.session_state.demo_trades.columns)
-                st.success("暫存資料已清空！")
-                st.rerun()
-            else:
-                try:
-                    google_sheet.clear()
-                    google_sheet.append_row(
-                        ["股票代號", "股票名稱", "交易類型", "股數", "成交單價", "交易時間", "手續費", "證交稅",
-                         "總收付金額", "策略標籤", "交易心得"])
-                    st.success("雲端資料已全部清空！")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"雲端清空失敗: {e}")
+            st.session_state.demo_trades = pd.DataFrame(columns=st.session_state.demo_trades.columns)
+            st.success("暫存資料已清空！")
+            st.rerun()
     else:
         st.info("目前尚無交易紀錄。")
 
 # ------------------------------------------
-# 【分頁 3：換股計算機與壓力測試】 - 保留原本功能
+# 【分頁 3：換股計算機與壓力測試】
 # ------------------------------------------
 with tab3:
     st.subheader("🧮 換股計算機與資產壓力測試")
