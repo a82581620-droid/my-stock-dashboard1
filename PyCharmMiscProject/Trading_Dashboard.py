@@ -1,25 +1,15 @@
-# This is a sample Python script.
-
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
-
-
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press ⌘F8 to toggle the breakpoint.
-
-
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
 import os
 from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import yfinance as yf
+
+# 🌟 為了連線 Google 雲端額外引入的工具
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+import gspread
+from dotenv import load_dotenv
 
 # ==========================================
 # 0. 網頁基本設定 & 精緻樣式
@@ -82,6 +72,7 @@ st.markdown(
         color: white !important;
     }
 
+    /* 財務指標看板專用樣式 */
     .metric-card-box {
         background-color: #F8FAFC;
         padding: 12px;
@@ -95,71 +86,134 @@ st.markdown(
 )
 
 st.title("📈 股票助理")
-st.caption("個人台股投資組合與多策略風險管理中心 (獨立雲端資料版)")
+st.caption("個人台股投資組合與多策略風險管理中心")
 
 # ==========================================
-# 1. 核心資料庫初始化與個人化雲端隔離設定
+# 🌟 Google 雲端連線設定中心 (讀取環境變數)
 # ==========================================
-# 讓使用者輸入自己的 Google 試算表 CSV 下載連結，達成每個人版本獨立
-st.sidebar.markdown("### 🔐 個人雲端資料庫設定")
-st.sidebar.markdown("為了讓每位使用者的資產資料完全獨立且不丟失，請串接您個人的 Google 試算表。")
-
-sheet_url = st.sidebar.text_input(
-    "請輸入您的 Google 試算表「共用連結」：",
-    placeholder="https://docs.google.com/spreadsheets/d/.../edit?usp=sharing",
-    help="請將您的 Google 試算表權限開啟為「知道連結的任何人均可檢視」，並把網址貼到這裡。"
-).strip()
+load_dotenv()
+CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+REDIRECT_URI = "http://localhost:8501/"
+SCOPES = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
 
 
-# 將一般 Google Sheet 網址轉換為可以直接讀取與寫入的 CSV 導出網址
-def get_csv_url(url):
+def create_oauth_flow():
+    client_config = {
+        "web": {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://accounts.google.com/o/oauth2/token",
+        }
+    }
+    return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+
+
+def get_google_sheet(creds_dict):
+    creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
+    client = gspread.authorize(creds)
+    file_name = "My_Stock_Assistant_Data"
     try:
-        if "/d/" in url:
-            sheet_id = url.split("/d/")[1].split("/")[0]
-            return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-    except:
-        return None
-    return None
+        sh = client.open(file_name)
+    except gspread.exceptions.SpreadsheetNotFound:
+        sh = client.create(file_name)
+        ws = sh.get_worksheet(0)
+        ws.append_row(
+            ["股票代號", "股票名稱", "交易類型", "股數", "成交單價", "交易時間", "手續費", "證交稅", "總收付金額",
+             "策略標籤", "交易心得"])
+    return sh.get_worksheet(0)
 
 
-csv_url = get_csv_url(sheet_url)
-
-# 初始化 Session State，用來暫存還沒同步到雲端的個人本地資料（以防使用者暫時沒綁定 Sheet）
-if "local_trades" not in st.session_state:
-    st.session_state.local_trades = pd.DataFrame(columns=[
-        "交易ID", "股票代號", "股票名稱", "交易類型", "股數", "成交單價",
-        "交易時間", "手續費", "證交稅", "總收付金額", "策略標籤", "交易心得"
+# ==========================================
+# 🌟 核心使用者驗證防護牆 (支援免登入試用)
+# ==========================================
+# 初始化試用模式的臨時資料庫（每個人獨立）
+if "demo_mode" not in st.session_state:
+    st.session_state.demo_mode = False
+if "demo_trades" not in st.session_state:
+    st.session_state.demo_trades = pd.DataFrame(columns=[
+        "股票代號", "股票名稱", "交易類型", "股數", "成交單價", "交易時間", "手續費", "證交稅", "總收付金額",
+        "策略標籤", "交易心得"
     ])
 
+# 如果既沒登入，也沒開啟試用模式，就顯示大門口
+if "google_creds" not in st.session_state and not st.session_state.demo_mode:
+    st.info("👋 歡迎使用！為了保障您的資料隱私，請選擇登入方式或直接開啟試用。")
 
-def load_trades():
-    # 如果使用者有提供個人試算表，直接從他的雲端讀取
-    if csv_url:
+    # 建立兩欄：左邊雲端登入，右邊免登入試用
+    login_col1, login_col2 = st.columns(2)
+
+    with login_col1:
+        st.markdown("### ☁️ 雲端正式版 (永久保存)")
+        st.caption("股票資料將 100% 儲存在您自己的 Google Drive，任何人皆無法竊取。")
+        flow = create_oauth_flow()
+        auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+        st.markdown(f'''
+            <a href="{auth_url}" target="_self">
+                <button style="background-color: #4285F4; color: white; border: none; padding: 12px 24px; font-size: 16px; border-radius: 8px; cursor: pointer; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1); width: 100%;">
+                    🔵 一鍵登入 Google 帳號
+                </button>
+            </a>
+        ''', unsafe_allow_html=True)
+
+    with login_col2:
+        st.markdown("### 🧪 免登入體驗版 (臨時暫存)")
+        st.caption("無需帳號密碼直接進去玩！每人資料完全獨立隔離，但只要重新整理或離開網頁，資料就會自動消失。")
+        if st.button("✨ 免登入：直接開啟試用體驗", use_container_width=True):
+            st.session_state.demo_mode = True
+            st.rerun()
+
+    # 接收 Google 回傳的密碼
+    query_params = st.query_params
+    if "code" in query_params:
         try:
-            df = pd.read_csv(csv_url, encoding="utf-8")
-            if "策略標籤" not in df.columns:
-                df["策略標籤"] = "#未分類"
-            if "交易心得" not in df.columns:
-                df["交易心得"] = ""
-            if not df.empty:
-                df["交易ID"] = range(1, len(df) + 1)
-            return df
+            flow.fetch_token(code=query_params["code"])
+            st.session_state.google_creds = flow.credentials.to_json()
+            st.success("🎉 登入成功！正在為您對接專屬雲端硬碟...")
+            st.rerun()
         except Exception as e:
-            st.sidebar.error(f"❌ 雲端讀取失敗，請確認試算表權限是否已開啟為「任何人均可檢視」。")
-            return st.session_state.local_trades
-    else:
-        return st.session_state.local_trades
-
-
-df_trades = load_trades()
-
-if csv_url:
-    st.sidebar.success("🟢 已成功連線至您的個人雲端試算表！")
-else:
-    st.sidebar.warning("🟡 目前使用「臨時體驗模式」，網頁重整資料會消失。建議於左側綁定個人 Google 試算表網址。")
+            st.error(f"登入驗證失敗，請重試。錯誤原因: {e}")
+    st.stop()
 
 # ==========================================
-# 2. 全域策略切換 (網頁最頂端)
+# 1. 核心資料庫路由 (雲端 vs 臨時記憶體)
+# ==========================================
+is_demo = st.session_state.demo_mode
+
+if is_demo:
+    st.sidebar.warning("⚡ 目前處於【免登入試用模式】，重新整理網頁資料即會消失！")
+    if st.sidebar.button("🔑 返回登入 Google 正式版"):
+        st.session_state.demo_mode = False
+        st.rerun()
+
+    # 直接讀取記憶體裡的暫存
+    df_trades = st.session_state.demo_trades.copy()
+    if not df_trades.empty:
+        df_trades["交易ID"] = range(1, len(df_trades) + 1)
+else:
+    # 走原本的 Google 雲端試算表路線
+    try:
+        google_sheet = get_google_sheet(eval(st.session_state.google_creds))
+        rows = google_sheet.get_all_records()
+        if rows:
+            df_trades = pd.DataFrame(rows)
+            df_trades["交易ID"] = range(1, len(df_trades) + 1)
+        else:
+            df_trades = pd.DataFrame()
+    except Exception as e:
+        st.error(f"雲端連線異常: {e}")
+        if st.sidebar.button("🔄 重置連線狀態"):
+            if "google_creds" in st.session_state: del st.session_state.google_creds
+            st.rerun()
+        st.stop()
+
+    if st.sidebar.button("🔒 安全登出 Google"):
+        del st.session_state.google_creds
+        st.rerun()
+
+# ==========================================
+# 2. 全域策略切換 (網頁最頂端) - 保留原本功能
 # ==========================================
 if not df_trades.empty:
     all_tags = ["✨ 顯示所有策略帳戶"] + sorted(df_trades["策略標籤"].dropna().unique().tolist())
@@ -176,7 +230,7 @@ else:
 st.write("---")
 
 # ==========================================
-# 3. 建立網頁分頁
+# 3. 建立網頁分頁 - 保留原本功能
 # ==========================================
 tab1, tab2, tab3 = st.tabs([
     "📊 持股比例圓餅圖",
@@ -185,29 +239,32 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # ------------------------------------------
-# 【分頁 1：持股比例圓餅圖】
+# 【分頁 1：持股比例圓餅圖】 - 保留原本功能
 # ------------------------------------------
 with tab1:
     st.subheader(f"📊 策略檢視：{global_selected_tag}")
 
     if not df_filtered_global.empty:
         summary_data = []
-        for (tag, ticker), df_group in df_filtered_global.groupby(["策略標籤", "股票代號"]):
-            name = df_group["股票名稱"].iloc[0]
-            buy_shares = df_group[df_group["交易類型"] == "買入 (Buy)"]["股數"].sum()
-            sell_shares = df_group[df_group["交易類型"] == "賣出 (Sell)"]["股數"].sum()
+
+        for ticker in df_filtered_global["股票代號"].unique():
+            df_ticker = df_filtered_global[df_filtered_global["股票代號"] == ticker]
+            name = df_ticker["股票名稱"].iloc[0]
+
+            buy_shares = df_ticker[df_ticker["交易類型"] == "買入 (Buy)"]["股數"].sum()
+            sell_shares = df_ticker[df_ticker["交易類型"] == "賣出 (Sell)"]["股數"].sum()
             current_shares = buy_shares - sell_shares
-            avg_cost = df_group[df_group["交易類型"] == "買入 (Buy)"]["成交單價"].mean()
+            avg_cost = df_ticker[df_ticker["交易類型"] == "買入 (Buy)"]["成交單價"].mean()
 
             if current_shares > 0:
                 summary_data.append({
-                    "策略標籤": tag, "股票代號": ticker, "股票名稱": name,
+                    "股票代號": ticker, "股票名稱": name,
                     "持股股數": current_shares, "備用現價": avg_cost
                 })
 
         if summary_data:
             portfolio_df = pd.DataFrame(summary_data)
-            stock_tickers = portfolio_df["股票代號"].unique().tolist()
+            stock_tickers = portfolio_df["股票代號"].tolist()
 
 
             def fetch_current_prices(tickers):
@@ -222,47 +279,43 @@ with tab1:
                 return prices
 
 
-            with st.spinner("🔍 股票助理正在連網更新目前的最新市價..."):
+            with st.spinner("🔍 股票助理正在連網更新此策略目前的最新市價..."):
                 current_prices = fetch_current_prices(stock_tickers)
 
             portfolio_df["當前現價"] = portfolio_df["股票代號"].map(
                 lambda tk: current_prices.get(tk) or portfolio_df[portfolio_df["股票代號"] == tk]["備用現價"].values[0])
             portfolio_df["目前市值"] = portfolio_df["持股股數"] * portfolio_df["當前現價"]
-            total_wealth = portfolio_df["Currently估計總市值"] = portfolio_df["目前市值"].sum()
+            total_wealth = portfolio_df["目前市值"].sum()
 
             col1, col2 = st.columns([3, 2])
             with col1:
-                st.markdown(f"### 💰 總資產市值: **${total_wealth:,.2f}**")
+                st.markdown(f"### 💰 該策略股票總市值: **${total_wealth:,.2f}**")
+
                 disp_portfolio = portfolio_df.copy()
                 disp_portfolio["新聞連結"] = disp_portfolio["股票代號"].apply(
                     lambda x: f"https://tw.stock.yahoo.com/q/h?s={x.split('.')[0]}")
                 disp_portfolio["股票代號"] = disp_portfolio["股票代號"].apply(lambda x: x.split('.')[0])
 
                 st.dataframe(
-                    disp_portfolio[
-                        ["策略標籤", "股票代號", "股票名稱", "持股股數", "當前現價", "目前市值", "新聞連結"]],
+                    disp_portfolio[["股票代號", "股票名稱", "持股股數", "當前現價", "目前市值", "新聞連結"]],
                     use_container_width=True,
                     column_config={"新聞連結": st.column_config.LinkColumn("📰 財經快訊", display_text="點我查看新聞")}
                 )
             with col2:
-                if global_selected_tag == "✨ 顯示所有策略帳戶":
-                    fig = px.pie(portfolio_df, values="開設市值" if False else "目前市值", names="策略標籤", hole=0.4,
-                                 title="各策略資產配置比例", color_discrete_sequence=px.colors.sequential.Teal_r)
-                else:
-                    fig = px.pie(portfolio_df, values="目前市值", names="股票名稱", hole=0.4,
-                                 title=f"{global_selected_tag} 策略內持股比例",
-                                 color_discrete_sequence=px.colors.sequential.Teal_r)
+                fig = px.pie(portfolio_df, values="目前市值", names="股票名稱", hole=0.4,
+                             color_discrete_sequence=px.colors.sequential.Teal_r)
                 st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("⚠️ 該策略帳戶目前無任何庫存持股。")
+            st.warning("⚠️ 該策略帳戶目前無 any 庫存持股。")
     else:
         st.info("💡 請先到交易記帳分頁紀錄您的第一筆交易並建立策略標籤。")
 
 # ------------------------------------------
-# 【分頁 2：交易記帳、流水帳與日記】
+# 【分頁 2：交易記帳、流水帳與日記】 - 完美兼容分流
 # ------------------------------------------
 with tab2:
     st.subheader("📥 新增交易紀錄")
+
     pre_ticker = st.text_input("📍 請先輸入代號觸發即時財務面板 (例: 2330 / 2454 / 0050)", value="2330").strip()
 
     if pre_ticker:
@@ -272,14 +325,21 @@ with tab2:
             if not yf.Ticker(search_pre).fast_info.get('lastPrice'): search_pre = f"{clean_pre}.TWO"
         except:
             search_pre = f"{clean_pre}.TWO"
+
         try:
             with st.spinner("📊 正在為您同步加載該股關鍵財務數據..."):
                 tk_obj = yf.Ticker(search_pre)
                 pe_ratio = tk_obj.info.get("trailingPE")
                 pe_str = f"{round(pe_ratio, 2)} 倍" if pe_ratio else "暫無數據"
+
                 st.markdown(
-                    f'<div class="metric-card-box"><b>🔍 實時財報看板 ({search_pre})</b> | <span>價盈比 (本益比 PE): <span style=\'color:#0ea5e9;font-weight:bold;\'>{pe_str}</span></span></div>',
-                    unsafe_allow_html=True)
+                    f"""
+                    <div class="metric-card-box">
+                        <b>🔍 實時財報看板 ({search_pre})</b> | 
+                        <span>價盈比 (本益比 PE): <span style='color:#0ea5e9;font-weight:bold;'>{pe_str}</span></span>
+                    </div>
+                    """, unsafe_allow_html=True
+                )
         except:
             pass
 
@@ -296,6 +356,7 @@ with tab2:
             t_datetime = st.datetime_input("交易日期與時間", datetime.now())
             t_notes = st.text_area("✍️ 交易日記 (買入原因/賣出動機/個股觀察)",
                                    placeholder="請記錄此筆交易的策略理由、心態觀察...")
+
         submit_button = st.form_submit_button(label="🚀 寫入交易紀錄與日記")
 
     if submit_button:
@@ -318,40 +379,49 @@ with tab2:
 
             formatted_time = t_datetime.strftime("%Y-%m-%d %H:%M")
             raw_amount = t_shares * t_price
+
             fee = max(20, round(raw_amount * 0.001425))
             tax = round(raw_amount * (0.001 if "00" in search_ticker else 0.003)) if t_type == "賣出 (Sell)" else 0
             total_cash = -(raw_amount + fee) if t_type == "買入 (Buy)" else (raw_amount - fee - tax)
 
-            new_trade = {
-                "交易ID": len(df_trades) + 1, "股票代號": search_ticker, "股票名稱": t_name, "交易類型": t_type,
-                "股數": t_shares, "成交單價": t_price, "交易時間": formatted_time,
-                "手續費": fee, "證交稅": tax, "總收付金額": total_cash,
+            new_row = {
+                "股票代號": search_ticker, "股票名稱": t_name, "交易類型": t_type,
+                "股數": int(t_shares), "成交單價": float(t_price), "交易時間": formatted_time,
+                "手續費": int(fee), "證交稅": int(tax), "總收付金額": float(total_cash),
                 "策略標籤": t_tag_input, "交易心得": t_notes
             }
 
-            # 更新本地 Session
-            st.session_state.local_trades = pd.concat([df_trades, pd.DataFrame([new_trade])], ignore_index=True)
-
-            st.success(f"🎉 成功記錄！名稱：【{t_name}】")
-            if csv_url:
-                st.info("💡 提示：請將下方產生的 CSV 文字，複製貼上回您的 Google 試算表中以完成雲端存檔。")
-                st.text_area("📋 複製此段文字並整段貼到 Google Sheet 第一個儲存格：",
-                             st.session_state.local_trades.to_csv(index=False), height=150)
-            else:
+            if is_demo:
+                # 試用模式：直接追加到暫存的 dataframe 裡
+                st.session_state.demo_trades = pd.concat([st.session_state.demo_trades, pd.DataFrame([new_row])],
+                                                         ignore_index=True)
+                st.success(f"🎉 (試用暫存) 成功寫入臨時記憶體！名稱：【{t_name}】")
                 st.rerun()
+            else:
+                # 正式模式：去寫入 Google 試算表
+                try:
+                    google_sheet.append_row(list(new_row.values()))
+                    st.success(f"🎉 成功同步到您的個人雲端硬碟！名稱：【{t_name}】")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"雲端寫入失敗: {e}")
 
     st.write("---")
 
     if not df_filtered_global.empty:
         st.subheader(f"📜 歷史交易流水帳 (經策略篩選)")
-        search_keyword = st.text_input("🔍 搜尋特定股票交易紀錄：",
-                                       placeholder="請輸入欲查詢的股票代號或名稱 (例如: 2330 或 台積電，留空顯示全部)",
-                                       key="table_search_input").strip()
+
+        search_keyword = st.text_input(
+            "🔍 搜尋特定股票交易紀錄：",
+            placeholder="請輸入欲查詢的股票代號或名稱 (例如: 2330 或 台積電，留空顯示全部)",
+            key="table_search_input"
+        ).strip()
 
         if search_keyword:
             df_filtered_search = df_filtered_global[
-                df_filtered_global["股票代號"].str.contains(search_keyword, case=False) | df_filtered_global[
-                    "股票名稱"].str.contains(search_keyword, case=False)]
+                df_filtered_global["股票代號"].str.contains(search_keyword, case=False) |
+                df_filtered_global["股票名稱"].str.contains(search_keyword, case=False)
+                ]
         else:
             df_filtered_search = df_filtered_global.copy()
 
@@ -361,9 +431,9 @@ with tab2:
             st.markdown('<div class="table-header">', unsafe_allow_html=True)
             h_col1, h_col2, h_col3, h_col4, h_col5, h_col6, h_col7, h_col8 = st.columns(
                 [0.6, 1.8, 2.7, 1.1, 1.2, 1.3, 1.5, 0.8])
-            h_col1.markdown("ID");
-            h_col2.markdown("交易時間");
-            h_col3.markdown("股票名稱 (標籤)");
+            h_col1.markdown("ID")
+            h_col2.markdown("交易時間")
+            h_col3.markdown("股票名稱 (標籤)")
             h_col4.markdown("類型")
             h_col5.markdown("<div style='text-align:right;'>股數</div>", unsafe_allow_html=True)
             h_col6.markdown("<div style='text-align:right;'>成交單價</div>", unsafe_allow_html=True)
@@ -374,13 +444,15 @@ with tab2:
             for _, row in df_display.iterrows():
                 st.markdown('<div class="table-row">', unsafe_allow_html=True)
                 col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([0.6, 1.8, 2.7, 1.1, 1.2, 1.3, 1.5, 0.8])
-                col1.write(f"{row['交易ID']}");
+                col1.write(f"{row['交易ID']}")
                 col2.write(f"{row['交易時間']}")
+
                 pure_code = row['股票代號'].split('.')[0]
                 yahoo_news_url = f"https://tw.stock.yahoo.com/q/h?s={pure_code}"
                 col3.markdown(
-                    f"**{row['股票名稱']}** (<span style='color:#0ea5e9;'>{row['策略標籤']}</span>) <a href='{yahoo_news_url}' target='_blank' class='news-link'>📰 新聞</a>",
+                    f"**{row['股票名稱']}** ({row['策略標籤']}) <a href='{yahoo_news_url}' target='_blank' class='news-link'>📰 新聞</a>",
                     unsafe_allow_html=True)
+
                 type_color = "#0284c7" if "買入" in row["交易類型"] else "#f43f5e"
                 col4.markdown(f"<span style='color:{type_color}; font-weight:bold;'>{row['交易類型']}</span>",
                               unsafe_allow_html=True)
@@ -390,10 +462,24 @@ with tab2:
                 col7.markdown(
                     f"<div style='text-align:right; color:{amt_color}; font-weight:bold;'>${row['總收付金額']:,.2f}</div>",
                     unsafe_allow_html=True)
+
                 with col8:
                     if st.button("🗑️", key=f"del_{row['交易ID']}"):
-                        st.session_state.local_trades = df_trades[df_trades["交易ID"] != row["交易ID"]]
-                        st.rerun()
+                        if is_demo:
+                            # 試用模式：從 dataframe 刪除對應索引
+                            idx_to_drop = st.session_state.demo_trades.index[int(row['交易ID']) - 1]
+                            st.session_state.demo_trades = st.session_state.demo_trades.drop(idx_to_drop).reset_index(
+                                drop=True)
+                            st.success("刪除成功！")
+                            st.rerun()
+                        else:
+                            try:
+                                google_sheet.delete_rows(int(row['交易ID']) + 1)
+                                st.success("刪除成功！")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"雲端刪除失敗: {e}")
+
                 if pd.notna(row['交易心得']) and str(row['交易心得']).strip() != "":
                     st.markdown(
                         f"<div style='padding-left:35px; color:#64748B; font-size:13px;'>📝 <b>交易日記：</b> {row['交易心得']}</div>",
@@ -401,16 +487,15 @@ with tab2:
                 st.markdown('</div>', unsafe_allow_html=True)
 
         st.write("---")
-        st.subheader("📊 已實現交易對照分析")
+        st.subheader("📊 已實現交易對照分析 (持有天數與真實損益)")
         df_sells = df_filtered_global[df_filtered_global["交易類型"] == "賣出 (Sell)"]
         df_buys = df_filtered_global[df_filtered_global["交易類型"] == "買入 (Buy)"]
 
         if not df_sells.empty and not df_buys.empty:
             summary_reports = []
             for _, sell_item in df_sells.iterrows():
-                past_buys = df_buys[
-                    (df_buys["股票代號"] == sell_item["股票代號"]) & (df_buys["策略標籤"] == sell_item["策略標籤"]) & (
-                                pd.to_datetime(df_buys["交易時間"]) <= pd.to_datetime(sell_item["交易時間"]))]
+                past_buys = df_buys[(df_buys["股票代號"] == sell_item["股票代號"]) & (
+                        pd.to_datetime(df_buys["交易時間"]) <= pd.to_datetime(sell_item["交易時間"]))]
                 if not past_buys.empty:
                     buy_date = pd.to_datetime(past_buys["交易時間"].min())
                     sell_date = pd.to_datetime(sell_item["交易時間"])
@@ -420,9 +505,8 @@ with tab2:
                     real_net_profit = sell_item["總收付金額"] - estimated_buy_cost
                     real_roi = (real_net_profit / estimated_buy_cost) * 100
                     summary_reports.append({
-                        "策略標籤": sell_item["策略標籤"], "股票": sell_item["股票名稱"], "代號": sell_item["股票代號"],
-                        "賣出時間": sell_item["交易時間"], "持有天數": f"{holding_days} 天",
-                        "真實損益 (精準淨利)": real_net_profit, "真實報酬率": real_roi
+                        "股票": sell_item["股票名稱"], "代號": sell_item["股票代號"], "賣出時間": sell_item["交易時間"],
+                        "持有天數": f"{holding_days} 天", "真實損益 (精準淨利)": real_net_profit, "真實報酬率": real_roi
                     })
             if summary_reports:
                 rep_df = pd.DataFrame(summary_reports)
@@ -430,17 +514,33 @@ with tab2:
                 st.dataframe(rep_df.style.format({"真實損益 (精準淨利)": "${:,.2f}", "真實報酬率": "{:.2f}%"}),
                              use_container_width=True)
 
-        if st.button("🚨 清空所有目前紀錄"):
-            st.session_state.local_trades = pd.DataFrame(columns=df_trades.columns)
-            st.rerun()
+        if st.button("🚨 清空所有歷史紀錄"):
+            if is_demo:
+                st.session_state.demo_trades = pd.DataFrame(columns=st.session_state.demo_trades.columns)
+                st.success("暫存資料已清空！")
+                st.rerun()
+            else:
+                try:
+                    google_sheet.clear()
+                    google_sheet.append_row(
+                        ["股票代號", "股票名稱", "交易類型", "股數", "成交單價", "交易時間", "手續費", "證交稅",
+                         "總收付金額", "策略標籤", "交易心得"])
+                    st.success("雲端資料已全部清空！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"雲端清空失敗: {e}")
+    else:
+        st.info("目前尚無交易紀錄。")
 
 # ------------------------------------------
-# 【分頁 3：換股計算機與壓力測試】
+# 【分頁 3：換股計算機與壓力測試】 - 保留原本功能
 # ------------------------------------------
 with tab3:
     st.subheader("🧮 換股計算機與資產壓力測試")
+
     st.markdown("#### 🔄 換股計算機")
     col_c1, col_c2, col_c3 = st.columns(3)
+
     with col_c1:
         calc_a_ticker = st.text_input("想賣出的 A 股代號", placeholder="2303", key="calc_a").strip()
         calc_a_shares = st.number_input("預計賣出股數", min_value=1, value=1000, step=100)
@@ -456,57 +556,119 @@ with tab3:
         else:
             clean_a = calc_a_ticker.replace(".TW", "").replace(".TWO", "").strip()
             clean_b = calc_b_ticker.replace(".TW", "").replace(".TWO", "").strip()
-            tk_a, tk_b = f"{clean_a}.TW", f"{clean_b}.TW"
+            tk_a = f"{clean_a}.TW"
+            tk_b = f"{clean_b}.TW"
+
             with st.spinner("🔍 股票助理正在即時連網獲取雙邊最新市價..."):
                 try:
                     st_a = yf.Ticker(tk_a)
                     if not st_a.fast_info.get('lastPrice'): tk_a = f"{clean_a}.TWO"
                     st_b = yf.Ticker(tk_b)
                     if not st_b.fast_info.get('lastPrice'): tk_b = f"{clean_b}.TWO"
+
                     price_a = yf.Ticker(tk_a).history(period="1d")["Close"].iloc[-1]
                     price_b = yf.Ticker(tk_b).history(period="1d")["Close"].iloc[-1]
+
                     total_sell_val = calc_a_shares * price_a
                     est_buy_shares = int(total_sell_val // price_b)
                     remain_cash = total_sell_val % price_b
+
                     st.success("📊 換股精算報告完成！")
                     st.markdown(
-                        f"* 當前 **{clean_a}** 市價：`${price_a:,.2f}` | 當前 **{clean_b}** 市價：`${price_b:,.2f}`\n* 預估賣出總價值：<b style='color:#EF4444;'>${total_sell_val:,.2f}</b>\n* 在不額外掏出本金的情況下，您可以**全數換購**：<b style='color:#10B981; font-size:18px;'>{est_buy_shares:,} 股</b> 的 {clean_b}\n* 換股後剩餘零錢現金：`${remain_cash:,.2f}`",
-                        unsafe_allow_html=True)
+                        f"""
+                        * 當前 **{clean_a}** 市價：`${price_a:,.2f}` | 當前 **{clean_b}** 市價：`${price_b:,.2f}`
+                        * 預估賣出總價值：<b style='color:#EF4444;'>${total_sell_val:,.2f}</b>
+                        * 在不額外掏出本金的情況下，您可以**全數換購**：<b style='color:#10B981; font-size:18px;'>{est_buy_shares:,} 股</b> 的 {clean_b}
+                        * 換股後剩餘零錢現金：`${remain_cash:,.2f}`
+                        """, unsafe_allow_html=True
+                    )
                 except Exception as ce:
-                    st.error(f"❌ 價格獲取失敗，錯誤原因: {ce}")
+                    st.error(f"❌ 價格獲取失敗，請確認代號是否正確。錯誤原因: {ce}")
 
     st.write("---")
+
     st.subheader("🚨 黑天鵝崩盤壓力測試模擬器")
-    if 'portfolio_df' in locals() and not portfolio_df.empty:
+    st.markdown("模擬市場極端系統性風險，評估當前篩選策略下持股在資產突發減損時的防禦力。")
+
+    current_portfolio = []
+    if not df_filtered_global.empty:
+        for ticker in df_filtered_global["股票代號"].unique():
+            df_ticker = df_filtered_global[df_filtered_global["股票代號"] == ticker]
+            name = df_ticker["股票名稱"].iloc[0]
+            buy_shares = df_ticker[df_ticker["交易類型"] == "買入 (Buy)"]["股數"].sum()
+            sell_shares = df_ticker[df_ticker["交易類型"] == "賣出 (Sell)"]["股數"].sum()
+            current_shares = buy_shares - sell_shares
+            if current_shares > 0:
+                avg_cost = df_ticker[df_ticker["交易類型"] == "買入 (Buy)"]["成交單價"].mean()
+                current_portfolio.append({"代號": ticker, "名稱": name, "股數": current_shares, "備用現價": avg_cost})
+
+    if current_portfolio:
+        df_stress_base = pd.DataFrame(current_portfolio)
+
+        with st.spinner("🔍 正在加載最新防守市價基準..."):
+            for idx, row in df_stress_base.iterrows():
+                try:
+                    df_stress_base.loc[idx, "當前現價"] = yf.Ticker(row["代號"]).history(period="1d")["Close"].iloc[-1]
+                except:
+                    df_stress_base.loc[idx, "當前現價"] = row["備用現價"]
+
+        df_stress_base["當前總市值"] = df_stress_base["股數"] * df_stress_base["當前現價"]
+        total_market_val = df_stress_base["當前總市值"].sum()
+
+        st.markdown("#### 🛠️ 設定黑天鵝慘劇劇本")
         col_s1, col_s2 = st.columns(2)
         with col_s1:
             drop_percent = st.slider("😱 模擬大盤/整體持股無差別暴跌幅度 (%)", min_value=5, max_value=50, value=20,
                                      step=5)
-        if st.button("💥 執行黑天鵝壓力測試"):
+        with col_s2:
+            heavy_stock_ticker = st.selectbox("🎯 挑選一檔核心權值股單獨加強外傷",
+                                              ["無"] + df_stress_base["代號"].tolist())
+            heavy_drop = st.slider("🔥 該權值股額外追加跌幅 (%)", min_value=0, max_value=60, value=30,
+                                   step=5) if heavy_stock_ticker != "無" else 0
+
+        if st.button("💥 執行黑天鵝壓力測試 (Launch Stress Test)"):
             st.write("---")
-            if global_selected_tag == "✨ 顯示所有策略帳戶":
-                df_stress = portfolio_df.groupby("策略標籤")["目前市值"].sum().reset_index()
-                df_stress["資產蒸發金額"] = df_stress["目前市值"] * (drop_percent / 100)
-                df_stress["預估崩盤後市值"] = df_stress["目前市值"] - df_stress["資產蒸發金額"]
-                post_crisis_total = total_wealth - df_stress["資產蒸發金額"].sum()
-                st.markdown(
-                    f"<div style='background-color:#EF444410; border: 2px dashed #EF4444; padding: 20px; border-radius: 8px; margin-bottom: 20px;'><h3 style='color:#EF4444; margin:0;'>☠️ 全策略資產重創警告</h3><p style='margin: 10px 0 0 0; color:#1E293B; font-size:16px;'>總市值將由 <b>${total_wealth:,.2f}</b> 驟降至 <b style='color:#EF4444;'>${post_crisis_total:,.2f}</b>。<br>整體資產在瞬間 <b>蒸發了 ${df_stress['資產蒸發金額'].sum():,.2f}</b> (跌幅為 <b>-{drop_percent}%</b>)！</p></div>",
-                    unsafe_allow_html=True)
-                st.dataframe(df_stress.style.format(
-                    {"目前市值": "${:,.2f}", "資產蒸發金額": "${:,.2f}", "預估崩盤後市值": "${:,.2f}"}),
-                             use_container_width=True)
-            else:
-                df_stress = portfolio_df.copy()
-                df_stress["資產蒸發金額"] = df_stress["目前市值"] * (drop_percent / 100)
-                df_stress["預估崩盤後市值"] = df_stress["目前市值"] - df_stress["資產蒸發金額"]
-                post_crisis_total = total_wealth - df_stress["資產蒸發金額"].sum()
-                st.markdown(
-                    f"<div style='background-color:#EF444410; border: 2px dashed #EF4444; padding: 20px; border-radius: 8px; margin-bottom: 20px;'><h3 style='color:#EF4444; margin:0;'>☠️ 策略【{global_selected_tag}】重創警告</h3><p style='margin: 10px 0 0 0; color:#1E293B; font-size:16px;'>該策略市值將由 <b>${total_wealth:,.2f}</b> 驟降至 <b style='color:#EF4444;'>${post_crisis_total:,.2f}</b>。<br>資產瞬間 <b>蒸發了 ${df_stress['資產蒸發金額'].sum():,.2f}</b>！</p></div>",
-                    unsafe_allow_html=True)
-                df_stress["股票代號"] = df_stress["股票代號"].apply(lambda x: x.split('.')[0])
-                st.dataframe(df_stress[["股票代號", "股票名稱", "持股股數", "當前現價", "目前市值", "資產蒸發金額",
-                                        "預估崩盤後市值"]].style.format(
-                    {"當前現價": "${:,.2f}", "目前市值": "${:,.2f}", "資產蒸發金額": "${:,.2f}",
-                     "預估崩盤後市值": "${:,.2f}"}), use_container_width=True)
+            st.markdown("### 🛑 壓力測試評估報告")
+
+            df_crushed = df_stress_base.copy()
+            total_vaporized = 0
+
+            for idx, row in df_crushed.iterrows():
+                current_drop = drop_percent
+                if heavy_stock_ticker != "無" and row["代號"] == heavy_stock_ticker:
+                    current_drop = heavy_drop
+
+                crushed_price = max(0.0, row["當前現價"] * (1 - current_drop / 100))
+                crushed_value = row["股數"] * crushed_price
+                vaporized = row["當前總市值"] - crushed_value
+                total_vaporized += vaporized
+
+                df_crushed.loc[idx, "模擬跌幅"] = f"-{current_drop}%"
+                df_crushed.loc[idx, "預估崩盤後股價"] = round(crushed_price, 2)
+                df_crushed.loc[idx, "資產蒸發金額"] = vaporized
+
+            post_crisis_total = total_market_val - total_vaporized
+            pct_lost = (total_vaporized / total_market_val) * 100 if total_market_val > 0 else 0
+
+            st.markdown(
+                f"""
+                <div style='background-color:#EF444410; border: 2px dashed #EF4444; padding: 20px; border-radius: 8px; margin-bottom: 20px;'>
+                    <h3 style='color:#EF4444; margin:0;'>☠️ 系統資產重創警告</h3>
+                    <p style='margin: 10px 0 0 0; color:#1E293B; font-size:16px;'>
+                        在目前篩選的策略中，您的股票總市值將由 <b>${total_market_val:,.2f}</b> 驟降至 <b style='color:#EF4444;'>${post_crisis_total:,.2f}</b>。<br>
+                        您的財富將在瞬間 <b>蒸發了 ${total_vaporized:,.2f}</b> (該策略持股重挫了 <b>-{pct_lost:.2f}%</b>)！
+                    </p>
+                </div>
+                """, unsafe_allow_html=True
+            )
+
+            st.markdown("#### 🔍 各檔個股損害明細")
+            df_crushed["代號"] = df_crushed["代號"].apply(lambda x: x.split('.')[0])
+            st.dataframe(
+                df_crushed[
+                    ["代號", "名稱", "股數", "當前現價", "模擬跌幅", "預估崩盤後股價", "資產蒸發金額"]].style.format({
+                    "當前現價": "${:,.2f}", "預估崩盤後股價": "${:,.2f}", "資產蒸發金額": "${:,.2f}"
+                }), use_container_width=True
+            )
     else:
         st.info("💡 壓力測試模擬器需要您的當前策略帳戶內有實質持股庫存才能進行運算喔！")

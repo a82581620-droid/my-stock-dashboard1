@@ -2,3 +2,7 @@ streamlit
 pandas
 plotly
 yfinance
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+gspread==6.1.0
+python-dotenv==1.0.1
